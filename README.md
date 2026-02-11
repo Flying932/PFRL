@@ -1,3 +1,6 @@
+# 本项目基于EarnMore框架进行了一些修改
+# 预训练-高效微调金融交易框架 - PFRL (2026-02-11)
+
 # EarnMore
 ```
 conda install pytorch==1.13.0 torchvision==0.14.0 torchaudio==0.13.0 pytorch-cuda=11.7 -c pytorch -c nvidia
