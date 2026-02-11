@@ -1,0 +1,437 @@
+SPF (Staged Pre-training with Frozen Backbone) Implementation Plan
+Project: EarnMore (ElegantRL + Qlib based)
+Repository root: . (run commands from oldEarnMore project root)
+
+===============================================================================
+1) Goal and Baseline Alignment
+===============================================================================
+
+Objective:
+- Implement a 3-stage portfolio management framework named SPF:
+  Stage 1: Multi-task Self-supervised Pre-training
+  Stage 2: Fully Frozen Backbone
+  Stage 3: PEFT + SAC RL Optimization
+
+Baseline mapping in this repo:
+- Representation backbone: pm/net/mask_time_state.py (MaskTimeState)
+- SAC agent: pm/agent/sac/mask_sac.py
+- Actor/Critic heads: pm/net/sac/mask_sac_net.py
+- Main training entry: tools/train.py
+- Env: pm/environment/pm_based_portfolio_value.py (EnvironmentPV)
+
+Important baseline behavior (for paper comparison):
+- In AgentMaskSAC, representation reconstruction is updated with its own optimizer
+  via rep_loss, while SAC losses update actor/critic/alpha.
+- In AgentMaskSyncSAC, rep/beta losses are directly added to critic objective.
+- Default config uses transaction_cost_pct = 1e-3 (0.1%).
+
+===============================================================================
+2) Original EarnMore Objective (Code-level Summary)
+===============================================================================
+
+From current repository implementation (AgentMaskSAC + MaskTimeState):
+
+1. Critic objective (twin Q):
+   L_Q = MSE(Q1(s, a), y) + MSE(Q2(s, a), y)
+   y = r + gamma * (1 - done) * (Q_min_target(s', a') - alpha * log_pi(a'|s'))
+
+2. Actor objective (SAC form):
+   L_pi ~ E[alpha * log_pi(a|s) - Q(s, a)]
+   (implemented by maximizing obj_actor = E[Q - alpha * log_pi])
+
+3. Entropy temperature objective:
+   L_alpha = E[alpha_log * (target_entropy - log_pi).detach()]
+
+4. Masked representation objective (MAE-style):
+   L_rep = mean_mask((pred - target)^2), computed only on masked tokens.
+
+5. Beta mask regularization:
+   L_beta = E[sum(weights * mask_bool)]
+
+In SPF, Stage 1 becomes standalone self-supervised pretraining before RL finetuning.
+
+===============================================================================
+3) SPF Overall Design
+===============================================================================
+
+Stage 1 (Pre-training):
+- Backbone: MaskTimeState encoder-decoder
+- Two tasks:
+  a) Masked Reconstruction (global reconstruction aligned with original paper idea)
+  b) Latent Contrastive Learning (NT-Xent)
+- Total loss:
+  L_total = lambda_recon * L_recon + lambda_contrastive * L_contrastive
+  defaults (if not specified in config/CLI):
+  lambda_recon = 1.0
+  lambda_contrastive = 0.7
+  fallback rule:
+  if either weight is missing, use the default value above
+- Default masking setup:
+  mask_ratio = 0.25 (configurable)
+- Save best checkpoint: pretrain_rep_best.pth
+
+Stage 2 (Fully Frozen Backbone):
+- Load pretrain_rep_best.pth into representation model.
+- Freeze all backbone parameters:
+  for p in rep.parameters(): p.requires_grad = False
+
+Stage 3 (PEFT + SAC):
+- Add hierarchical lightweight adapters after frozen rep output:
+  bottom_adapter -> mid_adapter -> top_adapter
+- Feed adapted state into actor/critic.
+- Update only:
+  adapter params + critic params + alpha_log
+  actor frozen by default (optional ablation switch to train actor).
+
+===============================================================================
+4) Stage 1 Details (Pre-training)
+===============================================================================
+
+4.1 Input and view construction
+- Input state tensor: [B, E, N, D, F]
+  B: batch, E: episode/window index, N: num_stocks, D: lookback days, F: features
+- For implementation simplicity, use M = B * E as effective batch.
+- Construct two augmented views x1, x2 for contrastive branch:
+  recommended augmentations:
+  - different sampled time windows for the same stock
+  - mild feature jitter/noise/dropout
+  - optional temporal masking
+
+4.2 Masked reconstruction branch (global reconstruction)
+- Use existing MaskTimeState mechanism:
+  - masked latent from encoder with if_mask=True
+  - global unmasked context kv from encoder with if_mask=False
+  - cross-attention decoder reconstructs all tokens
+- Reconstruction loss only on masked positions:
+  L_recon = ((pred - target)^2 * mask).sum() / mask.sum()
+- Stage 1 mask ratio:
+  default mask_ratio = 0.25, configurable by config/CLI.
+
+4.3 Contrastive branch (new)
+- Extract token embeddings from encoder output:
+  h1, h2 in [M, N, C]
+- Projection head:
+  z = MLP(h): Linear(C->C) -> GELU -> Linear(C->C)
+- Flatten token-level contrastive samples:
+  z1, z2 -> [M*N, C]
+- NT-Xent (exact logic required by spec):
+  def nt_xent_loss(z1, z2, temperature=0.2):
+      z1 = F.normalize(z1, dim=-1)
+      z2 = F.normalize(z2, dim=-1)
+      z = torch.cat([z1, z2], dim=0)  # [2B, C]
+      logits = torch.matmul(z, z.t()) / temperature
+      bsz = z1.shape[0]
+      labels = torch.arange(2 * bsz, device=z.device)
+      labels = (labels + bsz) % (2 * bsz)
+      self_mask = torch.eye(2 * bsz, dtype=torch.bool, device=z.device)
+      logits = logits.masked_fill(self_mask, -1e9)
+      return F.cross_entropy(logits, labels)
+
+4.4 Positive/negative definition
+- Positive pairs:
+  default: same stock across two windows/views + high-correlation stock pairs
+  where high-correlation threshold default is corr > 0.7 (configurable)
+  optional extension: same-sector pairs if sector labels are available
+- Negative pairs:
+  other random stocks within mini-batch
+
+4.5 Stage 1 output artifacts
+- Checkpoint path:
+  workdir/<tag>/pretrain_rep_best.pth
+- Save payload:
+  {
+    "rep": rep.state_dict(),
+    "epoch": ...,
+    "best_val_recon_loss": ...,
+    "best_val_contrastive_loss": ...,
+    "best_val_total_loss": ...,
+    "best_val_select_score": ...,
+    "cfg": ...
+  }
+
+4.6 Stage 1 validation and model selection
+- Validation must report all three losses:
+  val_recon_loss
+  val_contrastive_loss
+  val_total_loss = lambda_recon * val_recon_loss + lambda_contrastive * val_contrastive_loss
+- Model selection criterion:
+  use weighted sum (val_total_loss by default) as best-checkpoint score.
+- Selection score is configurable via:
+  pretrain_select_by in {"total", "recon", "contrastive"}
+  default: "total"
+- If pretrain_select_by="total", select minimum val_total_loss.
+- Early stopping (recommended default for this project):
+  pretrain_num_epochs = 1200
+  pretrain_min_epochs = 500
+  pretrain_patience = 50
+  pretrain_min_delta = 1e-4
+  trigger rule:
+  if epoch >= pretrain_min_epochs and best score does not improve by at least
+  pretrain_min_delta for pretrain_patience consecutive epochs, stop training.
+
+===============================================================================
+5) Stage 2 Details (Freeze Strategy)
+===============================================================================
+
+At finetune start:
+1. Build rep net with same architecture as pretrain stage.
+2. Load pretrain weights:
+   rep.load_state_dict(ckpt["rep"] or ckpt)
+3. Freeze full backbone:
+   rep.eval()
+   for p in rep.parameters():
+       p.requires_grad = False
+
+Forward usage in RL:
+- Use torch.no_grad() around rep.forward_state(...) to avoid gradient graph.
+- Output rep_state shape expected by adapter/heads: [B*E, N, D_embed]
+
+===============================================================================
+6) Stage 3 Details (PEFT + SAC)
+===============================================================================
+
+6.1 Hierarchical adapter design
+- New module: FrozenRepAdapterHierarchical
+- Chain: bottom -> mid -> top
+- Each adapter block:
+  LayerNorm(d_model)
+  Linear(d_model -> r)         # low-rank bottleneck, e.g., r=16
+  GELU
+  Linear(r -> d_model)
+  Dropout(0.1)
+  Residual add
+
+I/O:
+- Input: rep_state [B*E, N, D]
+- Output: adapted_state [B*E, N, D]
+
+6.2 Agent update policy
+- New agent: AgentSACFrozenRep
+- Components:
+  rep (frozen), adapter (trainable), actor, critic, alpha_log
+- Add explicit control parameters:
+  - actor_trainable: bool (default False)
+  - adapter_actor_grad: bool (default False)
+  - actor_on_adapter_weight: float (default 0.0)
+    meaning:
+    * False: adapter is optimized only by critic loss path
+    * True: adapter is allowed to receive actor gradient path;
+      effective actor driving requires actor_on_adapter_weight > 0.0
+- Default trainable params (recommended SPF default):
+  - adapter: trainable
+  - critic (twin Q): trainable
+  - alpha_log: trainable
+  - actor: frozen (actor_trainable=False)
+- Loss/gradient routing in Stage 3:
+  - Critic loss:
+    L_Q = MSE(Q1(h, a), y) + MSE(Q2(h, a), y)
+  - Actor loss (if actor_trainable=True):
+    L_actor = E[alpha * log_pi(a|h) - Q(h, a)]
+  - Adapter update modes:
+    * adapter_actor_grad=False:
+      adapter <- grad(L_Q) only
+      implementation hint: detach h before actor branch or keep adapter params
+      excluded from actor optimizer param groups
+    * adapter_actor_grad=True:
+      adapter <- grad(L_Q + actor_on_adapter_weight * L_actor)
+      implementation hint: include adapter params in actor optimizer param groups
+      if actor_on_adapter_weight <= 0.0, actor branch does not effectively drive adapter
+
+6.3 SAC behavior
+- Keep SAC target/entropy logic compatible with existing code.
+- Action dimension remains 29 (cash + 28 stocks).
+- Convert logits to weights by softmax (sum to 1).
+
+6.4 Environment/reward
+- Continue using EnvironmentPV.
+- Reward uses portfolio value transition with transaction cost.
+- Fee range for experiments:
+  0.05% to 0.1% (5e-4 to 1e-3), default can remain 1e-3.
+
+===============================================================================
+7) Files to Add/Modify
+===============================================================================
+
+7.1 New scripts
+- tools/pretrain_masked_rep.py
+  - standalone Stage 1 training
+  - logs recon/contrastive/total losses
+  - saves pretrain_rep_best.pth
+
+- tools/finetune_sac_frozen_rep.py
+  - Stage 2+3 RL finetune
+  - loads pretrain_rep_best.pth
+  - freezes rep
+  - supports two adapter gradient modes:
+    * critic-only adapter update
+    * critic+actor adapter update
+
+7.2 Representation updates
+- pm/net/mask_time_state.py
+  add:
+  - optional if_mask flag usage path for clean embedding extraction
+  - projection head for contrastive branch
+  - nt_xent_loss utility
+  - forward_pretrain(...) returning:
+    {loss_total, loss_recon, loss_contrastive, mask, ids_restore}
+
+7.3 Adapter and heads
+- pm/net/sac/mask_sac_net.py (or new pm/net/sac/frozen_rep_adapter.py)
+  add:
+  - ResidualLightweightAdapter
+  - FrozenRepAdapterHierarchical
+
+7.4 New agent
+- pm/agent/sac/frozen_rep_sac.py
+  add:
+  - AgentSACFrozenRep
+  - selective optimizer parameter groups
+  - state_dict save/load support for rep/adapter/act/cri/alpha and optimizers
+
+7.5 Registry exports
+- pm/agent/sac/__init__.py
+- pm/agent/__init__.py
+- pm/net/sac/__init__.py
+- pm/net/__init__.py
+  add imports so mmengine registry can build new modules by config.
+
+7.6 Config examples
+- configs/spf/pretrain_spf_portfolio_management.py
+- configs/spf/finetune_spf_frozen_rep_sac.py
+  include:
+  - lambda_recon / lambda_contrastive
+  - defaults in config:
+    lambda_recon=1.0
+    lambda_contrastive=0.7
+  - pretrain_select_by="total" (default)
+  - mask_ratio (default 0.25, configurable)
+  - corr_threshold (default 0.7 for high-corr positives)
+  - adapter rank/dropout
+  - actor_trainable flag
+  - adapter_actor_grad flag
+  - actor_on_adapter_weight (optional, default 0.0)
+  - pretrain checkpoint path
+
+===============================================================================
+8) Training Pipeline
+===============================================================================
+
+Step A: Stage 1 pretrain
+- Run tools/pretrain_masked_rep.py with train split.
+- Validate on val split and output:
+  val_recon_loss, val_contrastive_loss, val_total_loss.
+- Select best checkpoint by weighted sum (val_total_loss by default).
+- Save best as pretrain_rep_best.pth.
+- Throughput defaults for faster Stage 1:
+  AMP enabled, pin_memory enabled, persistent workers enabled.
+  For multi-GPU, launch with torchrun (DDP) for scalable pretraining.
+
+Step B: Stage 2+3 finetune
+- Run tools/finetune_sac_frozen_rep.py
+- Load pretrain checkpoint and freeze rep.
+- Collect transitions, update SAC with adapter-augmented states.
+- Choose adapter gradient mode by config:
+  - adapter_actor_grad=False (default, more stable)
+  - adapter_actor_grad=True (stronger adaptation, higher instability risk)
+
+Step C: Evaluation
+- Keep existing metrics:
+  ARR, SR(Sharpe), MDD, CR(Calmar), VOL, DD, SOR
+- Keep existing validation/testing style for comparability.
+
+===============================================================================
+9) Logging and Checkpoints
+===============================================================================
+
+Pretrain logging:
+- train/loss_recon
+- train/loss_contrastive
+- train/loss_total
+- val/loss_recon
+- val/loss_contrastive
+- val/loss_total
+- val/select_score
+
+Finetune logging:
+- obj_critics
+- obj_actors (if actor trainable)
+- alphas
+- adapter_grad_norm (optional)
+- rep_losses should be 0 or omitted in frozen mode
+- portfolio metrics (ARR/SR/MDD/CR...)
+- parameter statistics files under workdir tag:
+  param_stats.txt and param_stats.json
+  including per-module total/trainable/frozen counts and parameter names
+
+Checkpoint naming suggestion:
+- pretrain_rep_best.pth
+- checkpoint_XXXX.pth
+- best.pth (finetune best on val ARR)
+
+===============================================================================
+10) Ablation Matrix (for paper)
+===============================================================================
+
+Suggested experiments:
+
+A) Representation pretraining
+1. Recon only (lambda_contrastive = 0)
+2. Contrastive only (lambda_recon = 0)
+3. Recon + Contrastive (full SPF Stage 1)
+
+B) Finetuning strategy
+1. Full finetune (unfreeze rep)
+2. Frozen rep without adapter
+3. Frozen rep + single adapter
+4. Frozen rep + hierarchical adapters (full SPF Stage 3)
+
+C) Actor update policy
+1. actor frozen (default SPF)
+2. actor trainable
+
+D) Adapter gradient source
+1. critic-only (adapter_actor_grad=False)
+2. critic+actor (adapter_actor_grad=True)
+
+E) Positive pair policy in contrastive
+1. same-stock across windows
+2. same-stock + high-corr stocks
+3. same-stock + sector-based positives
+
+F) Transaction fee sensitivity
+1. 0.05%
+2. 0.10%
+
+===============================================================================
+11) Reproducibility Notes
+===============================================================================
+
+- Fix random seeds for torch/numpy/python.
+- Log exact train/val/test date ranges.
+- Record model size and trainable parameter count:
+  - full params
+  - trainable params in Stage 3
+- Report runtime and GPU memory.
+- Keep data preprocessing identical to baseline for fair comparison.
+
+===============================================================================
+12) Key Writing Points for Method Section
+===============================================================================
+
+1. SPF decouples representation learning from policy optimization:
+   - Stage 1 learns market structure priors via self-supervised objectives.
+   - Stage 2 prevents catastrophic drift by freezing backbone.
+   - Stage 3 restores adaptability with parameter-efficient adapters.
+
+2. Global masked reconstruction preserves cross-stock context:
+   - decoder queries masked tokens while attending to unmasked global tokens.
+
+3. Contrastive objective improves stock-level discriminability:
+   - encourages temporally consistent semantics and relation-aware clustering.
+
+4. Parameter efficiency:
+   - only lightweight adapters + critic + alpha are updated in finetuning.
+   - lowers optimization instability and overfitting risk.
+
+5. Compatibility:
+   - integrates into existing EarnMore pipeline and retains all evaluation metrics.
