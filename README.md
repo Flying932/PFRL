@@ -30,13 +30,5 @@ RL-Adventure: https://github.com/higgsfield/RL-Adventure
 
 Qlib: https://github.com/microsoft/qlib
 
-# Citing EarnMore
 
-```bibtex
-@inproceedings{zhang2024reinforcement,
-    title={Reinforcement Learning with Maskable Stock Representation for Portfolio Management in Customizable Stock Pools}, 
-    author={Wentao Zhang and Yilei Zhao and Shuo Sun and Jie Ying and Yonggang Xie and Zitao Song and Xinrun Wang and Bo An},
-    booktitle={The Web Conference 2024},
-    year={2024},
-}
 ```
